@@ -80,6 +80,10 @@ prs_method = load_stage('prs')
 scores = prs_method.score_prs(effect_dosage, weights, tag_mask)
 ```
 
+For a merged VCF, [VCF_PRS.md](VCF_PRS.md) documents the `score_vcf_prs.py`
+wrapper, including command-line and notebook use, allele matching, missing-call
+handling and per-sample output. It calls stage 03's scoring functions directly.
+
 Configure every real location privately. All shipped storage/project/dataset
 values are `path/to/folder`; each key must be replaced independently with the
 appropriate complete file, table or URI, not interpreted as a shared real path.
