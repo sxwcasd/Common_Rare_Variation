@@ -16,13 +16,13 @@ PGS_URL = 'https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS000004/Scoring
 
 def prepare_definition(definition):
     d = definition.copy().reset_index(drop=True)
-    if len(d) != 313:
-        raise ValueError('Unexpected public PGS definition size')
+    #if len(d) != 313:
+    #    raise ValueError('Unexpected public PGS definition size')
     d['variant_uid'] = np.arange(len(d))
     d['is_chek2_tagsnp'] = [(str(c), int(p)) in {('22', 29203724), ('22', 29551872)}
                            for c, p in zip(d.chr_name, d.chr_position)]
-    if d.is_chek2_tagsnp.sum() != 2:
-        raise ValueError('Public CHEK2 tag definition mismatch')
+    #if d.is_chek2_tagsnp.sum() != 2:
+    #    raise ValueError('Public CHEK2 tag definition mismatch')
     return d
 
 

@@ -15,6 +15,9 @@ python score_vcf_prs.py \
   --out-prefix /path/to/private_outputs/breast_prs
 ```
 
+```
+python score_vcf_prs.py   --vcf ~/workspace/workspace-bucket/filtered_vcfs_3820/filtered_proteomics_females_prs.vcf.bgz --genome-build hg38 --definition ~/workspace/workspace-bucket/PGS005381_hmPOS_GRCh38.txt.gz --out-prefix PGS003759_filtered_females
+```
 The default definition is the public [PGS000004 harmonized GRCh38 file](https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS000004/ScoringFiles/Harmonized/PGS000004_hmPOS_GRCh38.txt.gz).
 Use `--definition /path/to/PGS000004_hmPOS_GRCh38.txt.gz` for an offline copy.
 The original `chr_name`/`chr_position` columns identify the two CHEK2 tags;

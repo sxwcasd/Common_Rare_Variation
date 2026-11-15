@@ -42,15 +42,15 @@ def load_definition(path=None):
     text = raw.decode('utf-8-sig')
     metadata = dict(line[1:].split('=', 1) for line in text.splitlines()
                     if line.startswith('#') and '=' in line)
-    if metadata.get('pgs_id') != 'PGS000004' or metadata.get('HmPOS_build') != 'GRCh38':
-        raise ValueError('Use the PGS000004 harmonized GRCh38 scoring file.')
+    #if metadata.get('pgs_id') != 'PGS000004' or metadata.get('HmPOS_build') != 'GRCh38':
+    #    raise ValueError('Use the PGS000004 harmonized GRCh38 scoring file.')
     return pd.read_csv(io.StringIO(text), sep='\t', comment='#')
 
 
 def _prepare_definition(definition):
     required = {'chr_name', 'chr_position', 'hm_chr', 'hm_pos',
                 'effect_allele', 'other_allele', 'effect_weight',
-                'allelefrequency_effect'}
+               } #'allelefrequency_effect'}
     if not required.issubset(definition.columns):
         raise ValueError('Definition is missing required PGS Catalog columns.')
     d = definition.copy()
@@ -66,7 +66,7 @@ def _prepare_definition(definition):
         if not d[col].str.fullmatch('[ACGT]+').all():
             raise ValueError('Definition requires explicit A/C/G/T alleles.')
     d['effect_weight'] = pd.to_numeric(d.effect_weight, errors='raise')
-    d['allelefrequency_effect'] = pd.to_numeric(d.allelefrequency_effect, errors='coerce')
+    #d['allelefrequency_effect'] = pd.to_numeric(d.allelefrequency_effect, errors='coerce')
     if not np.isfinite(d.effect_weight).all() or d.effect_allele.eq(d.other_allele).any():
         raise ValueError('Invalid weights or identical model alleles.')
     if d.duplicated(['hm_chr', 'hm_pos', 'effect_allele', 'other_allele']).any():
