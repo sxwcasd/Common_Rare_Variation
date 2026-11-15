@@ -1,8 +1,8 @@
 """Score individual samples in a GRCh38 VCF using stage 03's PRS methods.
 
 Accepts local VCF/gzip/BGZF files or open text streams (including Hail GCS
-streams). Uses diploid GT hard calls, exact forward allele pairs and the
-public PGS000004 GRCh38 definition. See VCF_PRS.md for examples and limits.
+streams). Uses diploid GT hard calls and exact forward allele pairs, with the
+public PGS000004 GRCh38 definition as default. See VCF_PRS.md for examples.
 """
 import argparse
 from collections import defaultdict
@@ -30,7 +30,7 @@ class IncompleteScoreError(ValueError):
 
 
 def load_definition(path=None):
-    """Read the official harmonized PGS000004 file, retaining original loci."""
+    """Read a harmonized PGS file, retaining original loci and header metadata."""
     source = str(path or prs_method.PGS_URL)
     if source.startswith(('https://', 'http://')):
         with urlopen(source, timeout=60) as handle:
@@ -44,7 +44,9 @@ def load_definition(path=None):
                     if line.startswith('#') and '=' in line)
     #if metadata.get('pgs_id') != 'PGS000004' or metadata.get('HmPOS_build') != 'GRCh38':
     #    raise ValueError('Use the PGS000004 harmonized GRCh38 scoring file.')
-    return pd.read_csv(io.StringIO(text), sep='\t', comment='#')
+    definition = pd.read_csv(io.StringIO(text), sep='\t', comment='#')
+    definition.attrs.update(metadata)
+    return definition
 
 
 def _prepare_definition(definition):
@@ -121,6 +123,8 @@ def score_vcf(vcf, definition=None, *, genome_build, allow_partial=False,
     Missing loci never imply reference genotypes. Missing individual calls use
     the stage-03 scoring cohort mean; entirely missing loci cannot be imputed.
     AF resolution is opt-in because the published reference AF is European.
+    Score column names use the full definition size, not the matched subset.
+    PGS header metadata is retained in the pgs_id output column when available.
     """
     if genome_build != 'GRCh38':
         raise ValueError('This wrapper supports GRCh38 VCFs only; no implicit liftover.')
@@ -216,8 +220,13 @@ def score_vcf(vcf, definition=None, *, genome_build, allow_partial=False,
     x = np.stack([values for _, values, _ in accepted])
     selected = d.iloc[indices]
     scores = prs_method.score_prs(x, selected.effect_weight, selected.is_chek2_tagsnp,
-                                 direct_match=[direct for _, _, direct in accepted])
+                                 direct_match=[direct for _, _, direct in accepted],
+                                 n_model_loci=len(d),
+                                 n_model_chek2_tag_loci=int(d.is_chek2_tagsnp.sum()))
     scores.insert(0, 'sample_id', samples)
+    scores['pgs_id'] = d.attrs.get('pgs_id', pd.NA)
+    scores['n_model_loci'] = len(d)
+    scores['n_model_chek2_tag_loci'] = int(d.is_chek2_tagsnp.sum())
     scores['n_scored_loci'] = len(accepted)
     scores['n_scored_non_chek2_tag_loci'] = int((~selected.is_chek2_tagsnp).sum())
     scores['n_called_loci'] = np.isfinite(x).sum(axis=0)
@@ -231,7 +240,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--vcf', required=True, help='Local VCF/VCF.gz/VCF.bgz, or - for text stdin.')
     parser.add_argument('--genome-build', required=True, choices=['GRCh38'])
-    parser.add_argument('--definition', help='PGS000004 GRCh38 file/URL; defaults to the public PGS URL.')
+    parser.add_argument('--definition', help='Harmonized GRCh38 PGS file/URL; defaults to PGS000004.')
     parser.add_argument('--out-prefix', required=True, help='Private output prefix, outside the source repository.')
     parser.add_argument('--allow-partial', action='store_true')
     parser.add_argument('--resolve-by-af', action='store_true', help='Opt into stage-03 reference-AF ambiguity resolution.')

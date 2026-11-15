@@ -10,17 +10,17 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from score_vcf_prs import IncompleteScoreError, load_definition, main, score_vcf
+from score_vcf_prs import IncompleteScoreError, load_definition, main, score_vcf, prs_method
 
 
-def definition():
-    d = pd.DataFrame({'chr_name': ['1'] * 313, 'chr_position': np.arange(1000, 1313),
-                      'hm_chr': ['1'] * 313, 'hm_pos': np.arange(1000, 1313),
-                      'effect_allele': ['G'] * 313, 'other_allele': ['A'] * 313,
-                      'effect_weight': np.zeros(313), 'allelefrequency_effect': [0.1] * 313})
+def definition(n=313):
+    d = pd.DataFrame({'chr_name': ['1'] * n, 'chr_position': np.arange(1000, 1000 + n),
+                      'hm_chr': ['1'] * n, 'hm_pos': np.arange(1000, 1000 + n),
+                      'effect_allele': ['G'] * n, 'other_allele': ['A'] * n,
+                      'effect_weight': np.zeros(n), 'allelefrequency_effect': [0.1] * n})
     d.loc[:3, 'effect_weight'] = [0.2, -0.3, 0.4, 0.5]
     d.loc[1, ['other_allele', 'effect_allele']] = ['C', 'T']
-    for i, pos, weight in [(311, 29203724, 0.7), (312, 29551872, 0.9)]:
+    for i, pos, weight in [(n - 2, 29203724, 0.7), (n - 1, 29551872, 0.9)]:
         d.loc[i, ['chr_name', 'hm_chr', 'chr_position', 'hm_pos', 'effect_weight']] = ['22', '22', pos, pos, weight]
     return d
 
@@ -35,7 +35,7 @@ def vcf(d, replacements=None, omit=(), extras=()):
     replacements = replacements or {}
     return io.StringIO('##fileformat=VCFv4.2\n##reference=GRCh38\n'
                       '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t001\t002\n'
-                      + '\n'.join([replacements.get(i, record(d, i)) for i in range(313)
+                      + '\n'.join([replacements.get(i, record(d, i)) for i in range(len(d))
                                    if i not in omit] + list(extras)) + '\n')
 
 
@@ -131,6 +131,54 @@ class VCFScoringTests(unittest.TestCase):
         self.score(stream)
         self.assertFalse(stream.closed)
 
+    def test_configurable_stage03_names_preserve_score_calculations(self):
+        scores = prs_method.score_prs(
+            [[0, 1], [2, np.nan]], [0.2, 0.7], [False, True], [True, False],
+            n_model_loci=5218, n_model_chek2_tag_loci=1)
+        self.assertEqual(list(scores), ['PRS5218', 'PRS5218_no_CHEK2_tags',
+            'PRS5218_noimp', 'PRS5218_no_CHEK2_tags_noimp',
+            'PRS5218_no_CHEK2_tags_direct_only'])
+        np.testing.assert_allclose(scores.PRS5218, [1.4, 1.6])
+        np.testing.assert_allclose(scores.PRS5218_noimp, [1.4, 0.2])
+        np.testing.assert_allclose(scores.PRS5218_no_CHEK2_tags, [0, 0.2])
+        np.testing.assert_allclose(scores.PRS5218_no_CHEK2_tags_direct_only, [0, 0.2])
+
+    def test_partial_model_names_use_full_definition_not_matched_loci(self):
+        d = definition(5218)
+        # This synthetic 5218-locus model includes only one of the two tag sites.
+        d.loc[5217, ['chr_name', 'hm_chr', 'chr_position', 'hm_pos']] = ['1', '1', 6217, 6217]
+        d.attrs['pgs_id'] = 'PGS000015'
+        stream = vcf(d, {0: record(d, 0, ('0/1', '1/1'))}, omit=range(2, len(d)))
+        scores, report = score_vcf(stream, d, genome_build='GRCh38', allow_partial=True)
+        self.assertIn('PRS5218', scores)
+        self.assertIn('PRS5218_no_CHEK2_tags', scores)
+        self.assertNotIn('PRS313', scores)
+        self.assertNotIn('PRS311', scores)
+        self.assertNotIn('PRS2', scores)
+        self.assertTrue(scores.n_model_loci.eq(5218).all())
+        self.assertTrue(scores.n_model_chek2_tag_loci.eq(1).all())
+        self.assertTrue(scores.n_scored_loci.eq(2).all())
+        self.assertTrue(scores.n_missing_model_loci.eq(5216).all())
+        self.assertTrue(scores.pgs_id.eq('PGS000015').all())
+        self.assertFalse(scores.complete_model.any())
+        self.assertEqual(len(report), 5218)
+        np.testing.assert_allclose(scores.PRS5218, [0.2, 0.4])
+
+    def test_non313_model_without_tag_sites_has_explicit_names(self):
+        d = self.d.iloc[:4].copy()
+        scores, _ = score_vcf(vcf(d), d, genome_build='GRCh38')
+        self.assertIn('PRS4_no_CHEK2_tags', scores)
+        self.assertTrue(scores.n_model_chek2_tag_loci.eq(0).all())
+        np.testing.assert_array_equal(scores.PRS4, scores.PRS4_no_CHEK2_tags)
+        self.assertTrue(scores.complete_model.all())
+        self.assertTrue(scores.pgs_id.isna().all())
+
+    def test_invalid_model_counts_are_rejected(self):
+        for total, tags in [(1, 0), (2, 3), (2.0, 1), (True, 1), (2, 0)]:
+            with self.assertRaises(ValueError):
+                prs_method.score_prs([[0], [1]], [0.2, 0.7], [False, True],
+                    n_model_loci=total, n_model_chek2_tag_loci=tags)
+
     def test_cli_writes_scores_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -144,12 +192,32 @@ class VCFScoringTests(unittest.TestCase):
             self.assertEqual(main(args), 0)
             result = pd.read_csv(root / 'result.scores.tsv', sep='\t', dtype={'sample_id': str})
             self.assertEqual(result.sample_id.tolist(), ['001', '002'])
+            self.assertTrue(result.pgs_id.eq('PGS000004').all())
+            self.assertTrue(result.n_model_loci.eq(313).all())
+            self.assertIn('PRS311', result)
             self.assertEqual(len(pd.read_csv(root / 'result.variants.tsv', sep='\t')), 313)
             path.write_text(vcf(self.d, omit=[0]).getvalue())
             args[-1] = str(root / 'incomplete')
             self.assertEqual(main(args), 2)
             self.assertTrue((root / 'incomplete.variants.tsv').exists())
             self.assertFalse((root / 'incomplete.scores.tsv').exists())
+
+    def test_custom_model_metadata_drives_cli_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            d = self.d.iloc[:4].copy()
+            model = root / 'definition.txt.gz'
+            model.write_bytes(gzip.compress(('#pgs_id=PGS_TEST\n#HmPOS_build=GRCh38\n'
+                + d.to_csv(sep='\t', index=False)).encode()))
+            self.assertEqual(load_definition(model).attrs['pgs_id'], 'PGS_TEST')
+            path = root / 'samples.vcf'
+            path.write_text(vcf(d).getvalue())
+            self.assertEqual(main(['--vcf', str(path), '--definition', str(model),
+                '--genome-build', 'GRCh38', '--out-prefix', str(root / 'custom')]), 0)
+            scores = pd.read_csv(root / 'custom.scores.tsv', sep='\t')
+            self.assertIn('PRS4', scores)
+            self.assertNotIn('PRS313', scores)
+            self.assertTrue(scores.pgs_id.eq('PGS_TEST').all())
 
 
 if __name__ == '__main__':
