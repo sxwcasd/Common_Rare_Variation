@@ -234,7 +234,7 @@ def score_vcf(vcf, definition=None, *, genome_build, allow_partial=False,
                                  n_model_loci=len(d),
                                  n_model_chek2_tag_loci=int(d.is_chek2_tagsnp.sum()),
                                  chek2_mode=chek2_mode)
-    scores.insert(0, 'sample_id', samples)
+    scores.insert(0, 'person_id', samples)
     scores['pgs_id'] = d.attrs.get('pgs_id', pd.NA)
     scores['n_model_loci'] = len(d)
     scores['n_model_chek2_tag_loci'] = int(d.is_chek2_tagsnp.sum())
