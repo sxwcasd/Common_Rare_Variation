@@ -1,6 +1,7 @@
 """Synthetic VCF checks; contains no participant data."""
 import gzip
 import io
+from contextlib import redirect_stderr
 from pathlib import Path
 import sys
 import tempfile
@@ -143,6 +144,73 @@ class VCFScoringTests(unittest.TestCase):
         np.testing.assert_allclose(scores.PRS5218_no_CHEK2_tags, [0, 0.2])
         np.testing.assert_allclose(scores.PRS5218_no_CHEK2_tags_direct_only, [0, 0.2])
 
+    def test_stage03_include_mode_retains_tags_in_all_scores(self):
+        scores = prs_method.score_prs(
+            [[0, 1], [2, np.nan]], [0.2, 0.7], [False, True], [True, True],
+            n_model_loci=5218, n_model_chek2_tag_loci=1, chek2_mode='include')
+        self.assertEqual(list(scores), ['PRS5218', 'PRS5218_noimp', 'PRS5218_direct_only'])
+        np.testing.assert_allclose(scores.PRS5218, [1.4, 1.6])
+        np.testing.assert_allclose(scores.PRS5218_noimp, [1.4, 0.2])
+        np.testing.assert_allclose(scores.PRS5218_direct_only, [1.4, 1.6])
+        without_direct = prs_method.score_prs(
+            [[0, 1], [2, np.nan]], [0.2, 0.7], [False, True],
+            n_model_loci=5218, n_model_chek2_tag_loci=1, chek2_mode='include')
+        self.assertEqual(list(without_direct), ['PRS5218', 'PRS5218_noimp'])
+
+    def test_vcf_include_mode_preserves_full_scores_report_and_qc(self):
+        changes = {0: record(self.d, 0, ('0/1', '1/1')),
+                   311: record(self.d, 311, ('./.', '1/1')),
+                   312: record(self.d, 312, ('0/1', '0/0'))}
+        both, both_report = self.score(vcf(self.d, changes))
+        scores, report = self.score(vcf(self.d, changes), chek2_mode='include')
+        self.assertEqual([c for c in scores if c.startswith('PRS')],
+                         ['PRS313', 'PRS313_noimp', 'PRS313_direct_only'])
+        np.testing.assert_allclose(scores.PRS313, [2.5, 1.8])
+        np.testing.assert_allclose(scores.PRS313_noimp, [1.1, 1.8])
+        np.testing.assert_allclose(scores.PRS313_direct_only, [2.5, 1.8])
+        pd.testing.assert_frame_equal(scores[both.columns.intersection(scores.columns)],
+                                      both[both.columns.intersection(scores.columns)])
+        pd.testing.assert_frame_equal(report, both_report)
+        self.assertEqual(int(report.is_chek2_tagsnp.sum()), 2)
+        self.assertTrue(scores.n_model_chek2_tag_loci.eq(2).all())
+        self.assertTrue(scores.n_scored_non_chek2_tag_loci.eq(311).all())
+
+    def test_include_direct_only_omits_af_resolved_locus_but_retains_tag(self):
+        self.d.loc[0, 'allelefrequency_effect'] = 0.25
+        changes = {0: record(self.d, 0, ('0/1', '0/0')),
+                   311: record(self.d, 311, ('1/1', '1/1'))}
+        extra = record(self.d, 0, ('0/0', '0/0'), ref='G', alt='A')
+        scores, report = self.score(vcf(self.d, changes, extras=[extra]),
+                                     resolve_by_af=True, chek2_mode='include')
+        self.assertEqual(report.loc[0, 'status'], 'af_resolved')
+        self.assertEqual(report.loc[311, 'status'], 'matched')
+        np.testing.assert_allclose(scores.PRS313, [1.6, 1.4])
+        np.testing.assert_allclose(scores.PRS313_direct_only, [1.4, 1.4])
+
+    def test_include_mode_does_not_bypass_missing_tag_checks(self):
+        with self.assertRaises(IncompleteScoreError):
+            self.score(vcf(self.d, omit=[311]), chek2_mode='include')
+        scores, report = self.score(vcf(self.d, omit=[311]),
+                                     chek2_mode='include', allow_partial=True)
+        self.assertIn('PRS313', scores)
+        self.assertNotIn('PRS311', scores)
+        self.assertFalse(scores.complete_model.any())
+        self.assertTrue(scores.n_missing_model_loci.eq(1).all())
+        self.assertEqual(report.loc[311, 'status'], 'absent')
+
+    def test_invalid_chek2_modes_are_rejected_by_both_apis_and_cli(self):
+        for mode in ['invalid', None, True]:
+            with self.assertRaisesRegex(ValueError, 'chek2_mode'):
+                prs_method.score_prs([[0]], [0.2], [False], chek2_mode=mode)
+            with self.assertRaisesRegex(ValueError, 'chek2_mode'):
+                self.score(vcf(self.d), chek2_mode=mode)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as error:
+            main(['--vcf', 'unused.vcf', '--genome-build', 'GRCh38',
+                  '--out-prefix', 'unused', '--chek2-mode', 'invalid'])
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn('invalid choice', stderr.getvalue())
+
     def test_partial_model_names_use_full_definition_not_matched_loci(self):
         d = definition(5218)
         # This synthetic 5218-locus model includes only one of the two tag sites.
@@ -218,6 +286,25 @@ class VCFScoringTests(unittest.TestCase):
             self.assertIn('PRS4', scores)
             self.assertNotIn('PRS313', scores)
             self.assertTrue(scores.pgs_id.eq('PGS_TEST').all())
+
+    def test_cli_include_mode_writes_tag_inclusive_scores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / 'definition.txt'
+            model.write_text('#pgs_id=PGS000004\n#HmPOS_build=GRCh38\n'
+                             + self.d.to_csv(sep='\t', index=False))
+            path = root / 'samples.vcf'
+            path.write_text(vcf(self.d, {311: record(self.d, 311, ('1/1', '0/0'))}).getvalue())
+            self.assertEqual(main(['--vcf', str(path), '--definition', str(model),
+                '--genome-build', 'GRCh38', '--out-prefix', str(root / 'include'),
+                '--chek2-mode', 'include']), 0)
+            scores = pd.read_csv(root / 'include.scores.tsv', sep='\t')
+            self.assertEqual([c for c in scores if c.startswith('PRS')],
+                             ['PRS313', 'PRS313_noimp', 'PRS313_direct_only'])
+            np.testing.assert_allclose(scores.PRS313_direct_only, [1.4, 0])
+            self.assertTrue(scores.n_model_chek2_tag_loci.eq(2).all())
+            report = pd.read_csv(root / 'include.variants.tsv', sep='\t')
+            self.assertEqual(int(report.is_chek2_tagsnp.sum()), 2)
 
 
 if __name__ == '__main__':

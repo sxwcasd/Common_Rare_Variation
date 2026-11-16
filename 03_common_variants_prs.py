@@ -13,6 +13,7 @@ AF_GATES = {'d_min_max': 0.1, 'd_gap_min': 0.1, 'd_ratio_min': 3.0,
             'degenerate_af_ref_low': 0.4, 'degenerate_af_ref_high': 0.6,
             'max_missing_rate_flag': 0.1}
 PGS_URL = 'https://ftp.ebi.ac.uk/pub/databases/spot/pgs/scores/PGS000004/ScoringFiles/Harmonized/PGS000004_hmPOS_GRCh38.txt.gz'
+CHEK2_MODES = ('both', 'include')
 
 
 def prepare_definition(definition):
@@ -79,7 +80,7 @@ def decode_effect_dosage(raw_bytes, sample_count, effect_is):
 
 
 def score_prs(effect_dosage, weights, is_chek2_tag, direct_match=None, *,
-              n_model_loci=313, n_model_chek2_tag_loci=2):
+              n_model_loci=313, n_model_chek2_tag_loci=2, chek2_mode='both'):
     """Variants x samples; main mean imputation uses the scoring cohort.
 
     noimp means a zero contribution from missing calls, matching SCORE_SUM with
@@ -88,7 +89,14 @@ def score_prs(effect_dosage, weights, is_chek2_tag, direct_match=None, *,
     Model counts describe the full definition, before filtering to scorable
     loci. Defaults retain the original PRS313/PRS311 API. Other model sizes
     use PRS<N> and PRS<N>_no_CHEK2_tags, with the same score calculations.
+
+    chek2_mode='both' returns full and CHEK2-tag-excluded scores (the default).
+    chek2_mode='include' retains the original weights for all reported scores,
+    including PRS<N>_direct_only, and omits the tag-excluded score columns.
+    Direct-only scores still omit AF-resolved matches in either mode.
     """
+    if chek2_mode not in CHEK2_MODES:
+        raise ValueError(f'chek2_mode must be one of {CHEK2_MODES}')
     x = np.asarray(effect_dosage, dtype=float)
     w = np.asarray(weights, dtype=float)
     tags = np.asarray(is_chek2_tag, dtype=bool)
@@ -108,15 +116,21 @@ def score_prs(effect_dosage, weights, is_chek2_tag, direct_match=None, *,
         raise ValueError('A scoring locus is entirely missing')
     imputed = np.where(np.isnan(x), np.nanmean(x, axis=1)[:, None], x)
     zero = np.nan_to_num(x, nan=0.0)
-    reduced = np.where(tags, 0, w)
     full_name = f'PRS{n_model_loci}'
-    reduced_name = ('PRS311' if (n_model_loci, n_model_chek2_tag_loci) == (313, 2)
-                    else f'{full_name}_no_CHEK2_tags')
-    result = {full_name: w @ imputed, reduced_name: reduced @ imputed,
-              f'{full_name}_noimp': w @ zero, f'{reduced_name}_noimp': reduced @ zero}
+    result = {full_name: w @ imputed}
+    direct_name, direct_weights = full_name, w
+    if chek2_mode == 'both':
+        reduced = np.where(tags, 0, w)
+        reduced_name = ('PRS311' if (n_model_loci, n_model_chek2_tag_loci) == (313, 2)
+                        else f'{full_name}_no_CHEK2_tags')
+        result[reduced_name] = reduced @ imputed
+        direct_name, direct_weights = reduced_name, reduced
+    result[f'{full_name}_noimp'] = w @ zero
+    if chek2_mode == 'both':
+        result[f'{reduced_name}_noimp'] = reduced @ zero
     if direct_match is not None:
         mask = np.asarray(direct_match, dtype=bool)
-        result[f'{reduced_name}_direct_only'] = reduced[mask] @ imputed[mask]
+        result[f'{direct_name}_direct_only'] = direct_weights[mask] @ imputed[mask]
     return pd.DataFrame(result)
 
 

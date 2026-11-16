@@ -77,7 +77,8 @@ The main score name uses the number of rows in the **full model definition**,
 before matching/filtering. It does not change to `PRS2` when only two loci match.
 The default 313-locus model with two CHEK2 tags retains `PRS313`/`PRS311` names
 for compatibility with the numbered analysis modules. Other models name the
-tag-excluded score explicitly rather than calling it `PRS311`.
+tag-excluded score explicitly rather than calling it `PRS311`. The following
+table describes the default `chek2_mode="both"` output.
 
 | Calculation | PGS000004 (313 model loci) | PGS000015 (5218 model loci) |
 | --- | --- | --- |
@@ -92,6 +93,38 @@ it does not remove every variant in the CHEK2 gene. A supplied model may contain
 zero, one, or both sites. `n_model_chek2_tag_loci` records how many it contains.
 If no such sites are present, the tag-excluded score equals the main score.
 
+To retain CHEK2 tags in **every returned score**, set `chek2_mode="include"`
+in either `score_prs` or `score_vcf`, or pass `--chek2-mode include` to the CLI:
+
+```bash
+python score_vcf_prs.py \
+  --vcf /path/to/merged.vcf.bgz \
+  --genome-build GRCh38 \
+  --definition /path/to/PGS000004_hmPOS_GRCh38.txt.gz \
+  --chek2-mode include \
+  --out-prefix /path/to/private_outputs/breast_prs_with_chek2
+```
+
+```python
+scores, report = score_vcf(
+    "/path/to/merged.vcf.bgz",
+    definition="/path/to/PGS000004_hmPOS_GRCh38.txt.gz",
+    genome_build="GRCh38",
+    chek2_mode="include",
+)
+```
+
+This mode outputs `PRS<N>`, `PRS<N>_noimp`, and `PRS<N>_direct_only` (the last
+requires `direct_match` for direct stage-03 calls). It uses original weights
+for CHEK2-tagged loci and omits `PRS311`/`_no_CHEK2_tags` columns. Direct-only
+still excludes AF-resolved matches. The main `PRS<N>` and `PRS<N>_noimp` already
+included the tags in the default mode; their values do not change. The variant
+report and tag-count columns continue to describe which loci are CHEK2 tags.
+Matching, missing-call imputation, and completeness requirements are unchanged.
+
+The default `chek2_mode="both"` / `--chek2-mode both` preserves existing full
+and tag-excluded scores for compatibility.
+
 `pgs_id` records `#pgs_id` from the scoring file (or `definition.attrs['pgs_id']`
 for a DataFrame), and `n_model_loci` records the full definition size. These
 identify the intended model; `n_scored_loci` and `complete_model` describe actual
@@ -105,6 +138,7 @@ scores = prs_method.score_prs(
     effect_dosage, weights, tag_mask,
     n_model_loci=len(definition),
     n_model_chek2_tag_loci=int(definition.is_chek2_tagsnp.sum()),
+    chek2_mode="include",  # Omit this argument to return both score versions.
 )
 ```
 

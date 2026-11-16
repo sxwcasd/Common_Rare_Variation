@@ -72,7 +72,12 @@ def _prepare_definition(definition):
     if not np.isfinite(d.effect_weight).all() or d.effect_allele.eq(d.other_allele).any():
         raise ValueError('Invalid weights or identical model alleles.')
     if d.duplicated(['hm_chr', 'hm_pos', 'effect_allele', 'other_allele']).any():
-        raise ValueError('Duplicated model variant.')
+        d = d.drop_duplicates(
+            subset=['hm_chr', 'hm_pos', 'effect_allele', 'other_allele'],
+            keep='first'
+        )
+        Warning('Duplicated model variant. kept the first one')
+
     return prs_method.prepare_definition(d)
 
 
@@ -115,7 +120,7 @@ def _effect_dosages(fields, effect, other):
 
 
 def score_vcf(vcf, definition=None, *, genome_build, allow_partial=False,
-              resolve_by_af=False):
+              resolve_by_af=False, chek2_mode='both'):
     """Return (per-sample scores, per-model-variant matching report).
 
     definition may be a PGS file path/URL or its DataFrame. Callers supplying a
@@ -125,7 +130,12 @@ def score_vcf(vcf, definition=None, *, genome_build, allow_partial=False,
     AF resolution is opt-in because the published reference AF is European.
     Score column names use the full definition size, not the matched subset.
     PGS header metadata is retained in the pgs_id output column when available.
+    chek2_mode='include' retains CHEK2 tags in all returned scores, including
+    direct-only, and omits the tag-excluded columns. The default 'both' keeps
+    the original output schema. Variant matching and tag annotations are unchanged.
     """
+    if chek2_mode not in prs_method.CHEK2_MODES:
+        raise ValueError(f'chek2_mode must be one of {prs_method.CHEK2_MODES}')
     if genome_build != 'GRCh38':
         raise ValueError('This wrapper supports GRCh38 VCFs only; no implicit liftover.')
     d = _prepare_definition(definition if isinstance(definition, pd.DataFrame)
@@ -222,7 +232,8 @@ def score_vcf(vcf, definition=None, *, genome_build, allow_partial=False,
     scores = prs_method.score_prs(x, selected.effect_weight, selected.is_chek2_tagsnp,
                                  direct_match=[direct for _, _, direct in accepted],
                                  n_model_loci=len(d),
-                                 n_model_chek2_tag_loci=int(d.is_chek2_tagsnp.sum()))
+                                 n_model_chek2_tag_loci=int(d.is_chek2_tagsnp.sum()),
+                                 chek2_mode=chek2_mode)
     scores.insert(0, 'sample_id', samples)
     scores['pgs_id'] = d.attrs.get('pgs_id', pd.NA)
     scores['n_model_loci'] = len(d)
@@ -244,6 +255,8 @@ def main(argv=None):
     parser.add_argument('--out-prefix', required=True, help='Private output prefix, outside the source repository.')
     parser.add_argument('--allow-partial', action='store_true')
     parser.add_argument('--resolve-by-af', action='store_true', help='Opt into stage-03 reference-AF ambiguity resolution.')
+    parser.add_argument('--chek2-mode', choices=prs_method.CHEK2_MODES, default='both',
+                        help='both: full and tag-excluded scores (default); include: retain CHEK2 tags in all scores.')
     args = parser.parse_args(argv)
     scores_path = Path(args.out_prefix + '.scores.tsv')
     report_path = Path(args.out_prefix + '.variants.tsv')
@@ -251,7 +264,8 @@ def main(argv=None):
         parser.error('Output already exists. Choose a new --out-prefix.')
     try:
         scores, report = score_vcf(args.vcf, args.definition, genome_build=args.genome_build,
-                                   allow_partial=args.allow_partial, resolve_by_af=args.resolve_by_af)
+                                   allow_partial=args.allow_partial, resolve_by_af=args.resolve_by_af,
+                                   chek2_mode=args.chek2_mode)
     except IncompleteScoreError as error:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         error.report.to_csv(report_path, sep='\t', index=False)
