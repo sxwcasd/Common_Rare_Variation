@@ -50,9 +50,9 @@ def load_definition(path=None):
 
 
 def _prepare_definition(definition):
-    required = {'chr_name', 'chr_position', 'hm_chr', 'hm_pos',
+    required = {'hm_chr', 'hm_pos',
                 'effect_allele', 'other_allele', 'effect_weight',
-               } #'allelefrequency_effect'}
+               } #'chr_name', 'chr_position', 'allelefrequency_effect'}
     if not required.issubset(definition.columns):
         raise ValueError('Definition is missing required PGS Catalog columns.')
     d = definition.copy()
