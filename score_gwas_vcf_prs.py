@@ -8,7 +8,9 @@ it does not perform LD clumping or reproduce a validated published PRS.
 See GWAS_VCF_PRS.md. Requires numpy and pandas; reference validation also needs Hail.
 """
 import argparse
+from collections import defaultdict
 from contextlib import nullcontext
+from decimal import Decimal, InvalidOperation
 import gzip
 from pathlib import Path
 import re
@@ -74,7 +76,7 @@ def _weight(value, ci, effect_type):
     return -abs(raw) if decrease else raw, kind
 
 
-def _prepare_catalog(associations, trait, pvalue_text, effect_type):
+def _prepare_catalog(associations, trait, pvalue_text, effect_type, study=None):
     d = associations.copy() if isinstance(associations, pd.DataFrame) else pd.read_csv(
         associations, sep='\t', dtype='string')
     required = {'DISEASE/TRAIT', 'CHR_ID', 'CHR_POS',
@@ -82,6 +84,10 @@ def _prepare_catalog(associations, trait, pvalue_text, effect_type):
     if not required.issubset(d):
         raise ValueError(f'Missing Catalog columns: {sorted(required - set(d))}')
     d['source_row'] = np.arange(1, len(d) + 1)
+    if study is not None:
+        if 'STUDY ACCESSION' not in d:
+            raise ValueError('Catalog lacks STUDY ACCESSION for the requested filter.')
+        d = d.loc[d['STUDY ACCESSION'].eq(study)].copy()
     if trait is not None:
         d = d.loc[d['DISEASE/TRAIT'].eq(trait)].copy()
     if pvalue_text is not None:
@@ -90,6 +96,8 @@ def _prepare_catalog(associations, trait, pvalue_text, effect_type):
         d = d.loc[d['P-VALUE (TEXT)'].fillna('').eq(pvalue_text)].copy()
     if d.empty:
         raise ValueError('No associations match the trait/p-value annotation selection.')
+    if study is not None and d['DISEASE/TRAIT'].fillna('').nunique() != 1:
+        raise ValueError('Study contains multiple outcomes; select one with trait/--trait.')
     rows = []
     for row in d.to_dict('records'):
         row.update(status='pending', hm_chr=_chrom(row['CHR_ID']), hm_pos=np.nan,
@@ -118,13 +126,14 @@ def _prepare_catalog(associations, trait, pvalue_text, effect_type):
             row['catalog_eaf'] = af
         weight, kind = _weight(row['OR or BETA'], row.get('95% CI (TEXT)'), effect_type)
         row['effect_weight'], row['effect_type'] = weight, kind
-        if not np.isfinite(weight) and row['status'] == 'pending':
-            row['status'] = kind
+        row['mapping_status'] = row['status']
+        row['weight_status'] = 'eligible' if np.isfinite(weight) else kind
         rows.append(row)
     report = pd.DataFrame(rows)
     valid_pos = report['hm_pos'].notna()
     duplicated = report.loc[valid_pos].duplicated(['hm_chr', 'hm_pos'], keep=False)
-    report.loc[duplicated.index[duplicated], 'status'] = 'duplicate_association_locus'
+    report['duplicate_locus'] = False
+    report.loc[duplicated.index[duplicated], 'duplicate_locus'] = True
     return report
 
 
@@ -160,8 +169,9 @@ def _alt_dosage(fields, n_samples):
 def _read_targets(vcf, targets, frequency_samples):
     """Stream VCF once; retain GT arrays only for selected target coordinates."""
     samples, frequency_indices = None, None
-    records = {}
-    seen, conflicting = set(), set()
+    records = defaultdict(list)
+    seen = set()
+    n_vcf_records = 0
     with _open_vcf(vcf) as handle:
         for line in handle:
             if line.startswith(('##reference=', '##contig=')) and re.search(
@@ -188,6 +198,7 @@ def _read_targets(vcf, targets, frequency_samples):
             fields = line.rstrip('\r\n').split('\t')
             if len(fields) < 8:
                 raise ValueError('Malformed VCF record.')
+            n_vcf_records += 1
             key = (_chrom(fields[0]), int(fields[1]))
             if key not in targets:
                 continue
@@ -195,8 +206,6 @@ def _read_targets(vcf, targets, frequency_samples):
             if len(fields) != 9 + len(samples):
                 raise ValueError('Target VCF record has an inconsistent sample count.')
             if fields[6] not in {'PASS', '.'}:
-                continue
-            if key in conflicting:
                 continue
             ref, alt = fields[3:5]
             status = 'pending'
@@ -209,22 +218,23 @@ def _read_targets(vcf, targets, frequency_samples):
                 status = 'missing_GT'
             ids = {x for x in fields[2].split(';') if re.fullmatch(r'rs\d+', x)}
             new = dict(ref=ref, alt=alt, dosage=dosage, status=status, ids=ids)
-            if key in records:
-                old = records[key]
-                same = old['ref'] == ref and old['alt'] == alt and old['status'] == status
+            old = next((r for r in records[key] if r['ref'] == ref and r['alt'] == alt), None)
+            if old is not None:
+                if old['status'] == 'conflicting_vcf_records':
+                    continue
+                same = old['status'] == status
                 same = same and ((old['dosage'] is None and dosage is None) or
                                  (old['dosage'] is not None and dosage is not None and
                                   np.array_equal(old['dosage'], dosage, equal_nan=True)))
                 if not same or (ids and old['ids'] and ids != old['ids']):
-                    conflicting.add(key)
-                    records[key] = dict(status='conflicting_vcf_records')
+                    old.update(status='conflicting_vcf_records', dosage=None)
                 else:
                     old['ids'].update(ids)
             else:
-                records[key] = new
+                records[key].append(new)
     if samples is None:
         raise ValueError('VCF is missing its #CHROM sample header.')
-    return samples, frequency_indices, records, seen
+    return samples, frequency_indices, records, seen, n_vcf_records
 
 
 def _hail_reference_bases(targets):
@@ -312,11 +322,112 @@ def _orient(row, record, frequency_indices, *, max_af_diff, min_af_gap,
                 frequency_check=check, vcf_effect_af=af, af_difference=difference)
 
 
+def _match_site(row, site_records, frequency_indices, reference_source, reference_base, **af_options):
+    """Map an association independently of its weight and repeated publications."""
+    effect = row['reported_effect_allele']
+    complement = effect.translate(COMPLEMENT)
+    compatible = [r for r in site_records
+                  if r['ref'] in {'A', 'C', 'G', 'T'} and r['alt'] in {'A', 'C', 'G', 'T'}
+                  and (effect in (r['ref'], r['alt']) or complement in (r['ref'], r['alt']))]
+    details = dict(n_sequence_candidates=len(compatible), n_vcf_candidates=len(site_records),
+                   candidate_statuses='', sequence_match=bool(compatible))
+    refs = {r['ref'] for r in site_records}
+    if len(refs) != 1:
+        return dict(details, status='inconsistent_vcf_ref'), None
+    ref = next(iter(refs))
+    details['vcf_ref'] = ref
+    if len(site_records) == 1:
+        details['vcf_alt'] = site_records[0]['alt']
+    if reference_source == 'hail':
+        base = _text(reference_base).upper()
+        details['reference_base'] = base
+        if len(base) != 1 or base not in 'ACGT':
+            return dict(details, status='reference_unavailable', reference_check='missing_or_non_acgt'), None
+        if base != ref:
+            return dict(details, status='reference_mismatch', reference_check='mismatch'), None
+        details['reference_check'] = 'match'
+    if not compatible:
+        statuses = {r['status'] for r in site_records}
+        reason = next(iter(statuses)) if len(statuses) == 1 and 'pending' not in statuses else 'allele_mismatch'
+        return dict(details, status=reason), None
+    # A downcoded split record's 0 allele may include other ALT alleles.
+    # Without the original unsplit GT, 2 - ALT dosage is not proven REF dosage.
+    if len(site_records) > 1 and ref in {effect, complement}:
+        return dict(details, status='split_site_ref_effect_ambiguous'), None
+    failures, supported = [], []
+    catalog_ids = {row['rsID'], row['current_rsID']} - {''}
+    for record in compatible:
+        if record['status'] != 'pending':
+            failures.append(record['status'])
+            continue
+        if record['ids'] and not catalog_ids.intersection(record['ids']):
+            failures.append('rsid_mismatch')
+            continue
+        result = _orient(row, record, frequency_indices, **af_options)
+        if result['status'] == 'accepted':
+            supported.append((record, result))
+        else:
+            failures.append(result['status'])
+            if len(compatible) == 1:
+                details.update(result)
+    details['candidate_statuses'] = ';'.join(sorted(set(failures)))
+    if 'conflicting_vcf_records' in failures:
+        return dict(details, status='conflicting_vcf_records'), None
+    if len(supported) != 1:
+        if supported:
+            reason = 'ambiguous_vcf_candidates'
+        else:
+            reason = failures[0] if len(set(failures)) == 1 else 'no_eligible_vcf_candidate'
+        return dict(details, status=reason), None
+    record, result = supported[0]
+    details.update(result)
+    dosage = record['dosage'] if result['effect_allele'] == record['alt'] else 2 - record['dosage']
+    return details, dosage
+
+
+def _pvalue(value):
+    """Keep tiny reported p-values sortable without float underflow."""
+    try:
+        result = Decimal(_text(value))
+        return result if result.is_finite() and 0 < result <= 1 else None
+    except InvalidOperation:
+        return None
+
+
+def _select_weights(report, duplicate_policy):
+    report['status'] = report['mapping_status'].where(
+        report['mapping_status'].ne('matched'), report['weight_status'])
+    report.loc[report['status'].eq('eligible'), 'status'] = 'accepted'
+    report['selection_rule'] = duplicate_policy
+    report['selected_for_score'] = False
+    if duplicate_policy == 'exclude':
+        report.loc[report['duplicate_locus'], 'status'] = 'duplicate_association_locus'
+    else:
+        eligible = report.loc[report['status'].eq('accepted')]
+        for _, group in eligible.groupby(['hm_chr', 'hm_pos', 'vcf_ref', 'vcf_alt'], sort=False):
+            if len(group) == 1:
+                continue
+            ranked = {i: _pvalue(row.get('P-VALUE')) for i, row in group.iterrows()}
+            valid = {i: p for i, p in ranked.items() if p is not None}
+            report.loc[group.index, 'status'] = 'duplicate_association_not_selected'
+            report.loc[[i for i, p in ranked.items() if p is None], 'status'] = 'missing_selection_pvalue'
+            if not valid:
+                continue
+            best_p = min(valid.values())
+            ties = report.loc[[i for i, p in valid.items() if p == best_p]]
+            if len(ties[['effect_allele', 'effect_weight']].drop_duplicates()) != 1:
+                report.loc[ties.index, 'status'] = 'tied_pvalue_conflicting_weights'
+                continue
+            selected = ties.sort_values('source_row').index[0]
+            report.at[selected, 'status'] = 'accepted'
+    report['selected_for_score'] = report['status'].eq('accepted')
+
+
 def score_gwas_vcf(vcf, associations, *, genome_build, trait=None,
                    pvalue_text=None, effect_type='auto', frequency_samples=None,
                    allow_partial=False, max_af_diff=.10, min_af_gap=.10,
                    min_af_samples=20, palindromic_maf_max=.42, min_af_call_rate=.9,
-                   reference_source='vcf'):
+                   reference_source='vcf', duplicate_policy='exclude', study=None):
     """Return (scores, harmonized_reference, audit_report) for a selected trait.
 
     Frequency inference assumes Catalog EAF and the selected frequency cohort
@@ -329,11 +440,18 @@ def score_gwas_vcf(vcf, associations, *, genome_build, trait=None,
     The default 'vcf' retains the original behavior without a FASTA lookup.
     FASTA verification alone does not resolve the reported effect's strand at
     palindromic SNPs; the existing frequency checks still apply.
+    duplicate_policy='lowest_p' selects one lowest-p-value eligible association
+    per VCF REF/ALT variant after mapping. Tied differing weights are unresolved.
+    Mapping and weight/selection statuses are recorded separately in the audit.
     """
     if genome_build != 'GRCh38':
         raise ValueError('Only GRCh38 is supported; no implicit liftover.')
     if reference_source not in {'vcf', 'hail'}:
         raise ValueError('reference_source must be vcf or hail.')
+    if effect_type not in {'auto', 'or', 'beta'}:
+        raise ValueError('effect_type must be auto, or, or beta.')
+    if duplicate_policy not in {'exclude', 'lowest_p'}:
+        raise ValueError('duplicate_policy must be exclude or lowest_p.')
     for name, value in [('max_af_diff', max_af_diff), ('min_af_gap', min_af_gap),
                         ('min_af_call_rate', min_af_call_rate)]:
         if not np.isfinite(value) or not 0 <= value <= 1:
@@ -343,56 +461,44 @@ def score_gwas_vcf(vcf, associations, *, genome_build, trait=None,
         raise ValueError('Require 0 <= palindromic_maf_max < 0.5 and positive integer min_af_samples.')
     if isinstance(frequency_samples, (str, bytes)):
         raise ValueError('frequency_samples must be a collection of IDs, not one string.')
-    report = _prepare_catalog(associations, trait, pvalue_text, effect_type)
+    report = _prepare_catalog(associations, trait, pvalue_text, effect_type, study)
     targets = {(row.hm_chr, int(row.hm_pos)) for row in report.itertuples()
-               if row.status == 'pending'}
-    samples, freq_indices, records, seen = _read_targets(vcf, targets, frequency_samples)
-    reference_bases = (_hail_reference_bases({key for key, record in records.items()
-                                            if record['status'] == 'pending'})
+               if pd.notna(row.hm_pos) and re.fullmatch(r'(?:[1-9]|1[0-9]|2[0-2]|X|Y|MT)', row.hm_chr)}
+    samples, freq_indices, records, seen, n_vcf_records = _read_targets(vcf, targets, frequency_samples)
+    reference_bases = (_hail_reference_bases({key for key, site in records.items()
+                                            if any(r['status'] == 'pending' for r in site)})
                        if reference_source == 'hail' else {})
     report['reference_source'] = reference_source
     report['reference_base'] = ''
     report['reference_check'] = 'not_checked' if reference_source == 'hail' else 'not_requested'
     report['vcf_ref'], report['vcf_alt'] = '', ''
-    accepted_dosages = []
+    report['coordinate_match'] = [(r.hm_chr, int(r.hm_pos)) in seen if pd.notna(r.hm_pos) else False
+                                  for r in report.itertuples()]
+    report['sequence_match'] = False
+    mapped_dosages = {}
     for index, row in report.iterrows():
-        if row['status'] != 'pending':
+        if row['mapping_status'] != 'pending':
             continue
         key = (row['hm_chr'], int(row['hm_pos']))
         if key not in records:
-            report.at[index, 'status'] = 'filtered_only' if key in seen else 'absent'
+            report.at[index, 'mapping_status'] = 'filtered_only' if key in seen else 'absent'
             continue
-        record = records[key]
-        if record['status'] != 'pending':
-            report.at[index, 'status'] = record['status']
-            continue
-        report.at[index, 'vcf_ref'], report.at[index, 'vcf_alt'] = record['ref'], record['alt']
-        if reference_source == 'hail':
-            base = _text(reference_bases.get(key)).upper()
-            report.at[index, 'reference_base'] = base
-            if len(base) != 1 or base not in 'ACGT':
-                report.at[index, 'status'] = 'reference_unavailable'
-                report.at[index, 'reference_check'] = 'missing_or_non_acgt'
-                continue
-            if base != record['ref']:
-                report.at[index, 'status'] = 'reference_mismatch'
-                report.at[index, 'reference_check'] = 'mismatch'
-                continue
-            report.at[index, 'reference_check'] = 'match'
-        catalog_ids = {row['rsID'], row['current_rsID']} - {''}
-        if record['ids'] and not catalog_ids.intersection(record['ids']):
-            report.at[index, 'status'] = 'rsid_mismatch'
-            continue
-        details = _orient(row, record, freq_indices, max_af_diff=max_af_diff,
+        details, dosage = _match_site(row, records[key], freq_indices, reference_source,
+                          reference_bases.get(key), max_af_diff=max_af_diff,
                           min_af_gap=min_af_gap, min_af_samples=min_af_samples,
                           palindromic_maf_max=palindromic_maf_max, min_af_call_rate=min_af_call_rate)
         for field, value in details.items():
+            if field == 'status':
+                continue
             if field not in report:
                 report[field] = pd.Series([pd.NA] * len(report), dtype='object')
             report.at[index, field] = value
         if details['status'] == 'accepted':
-            dosage = record['dosage']
-            accepted_dosages.append(dosage if details['effect_allele'] == record['alt'] else 2 - dosage)
+            report.at[index, 'mapping_status'] = 'matched'
+            mapped_dosages[index] = dosage
+        else:
+            report.at[index, 'mapping_status'] = details['status']
+    _select_weights(report, duplicate_policy)
     report['hm_pos'] = report['hm_pos'].astype('Int64')
     for field in ['vcf_alt_af', 'vcf_ref_af', 'vcf_effect_af', 'af_difference',
                   'direct_af_difference', 'complement_af_difference', 'af_call_rate']:
@@ -403,12 +509,14 @@ def score_gwas_vcf(vcf, associations, *, genome_build, trait=None,
     reference = report.loc[report['status'].eq('accepted')].copy().reset_index(drop=True)
     reference['allelefrequency_effect'] = reference['catalog_eaf']
     reference.attrs.update(HmPOS_build='GRCh38', 
-                           score_type='exploratory_GWAS_associations', reference_source=reference_source)
-    if reference.empty or (len(reference) != len(report) and not allow_partial):
+                           score_type='exploratory_GWAS_associations', reference_source=reference_source,
+                           duplicate_policy=duplicate_policy)
+    complete = bool(report['status'].isin(['accepted', 'duplicate_association_not_selected']).all())
+    if reference.empty or (not complete and not allow_partial):
         raise IncompleteGWASScoreError(
             f'{len(reference)}/{len(report)} selected associations are scorable. '
             'Inspect the report; allow_partial=True explicitly permits a reduced score.', report, reference)
-    x = np.asarray(accepted_dosages, dtype=np.float64)
+    x = np.asarray([mapped_dosages[i] for i in report.index[report['selected_for_score']]], dtype=np.float64)
     weights = reference['effect_weight'].to_numpy(dtype=float)
     means = np.nanmean(x, axis=1)
     scores = pd.DataFrame({'person_id': samples,
@@ -418,7 +526,13 @@ def score_gwas_vcf(vcf, associations, *, genome_build, trait=None,
                            'n_imputed_variants': np.isnan(x).sum(axis=0)})
     scores['n_selected_associations'] = len(report)
     scores['n_scored_variants'] = len(reference)
-    scores['complete_model'] = len(reference) == len(report)
+    scores['n_vcf_records'] = n_vcf_records
+    scores['n_sequence_matched_positions'] = len(report.loc[report['sequence_match'], ['hm_chr', 'hm_pos']].drop_duplicates())
+    scores['n_mapped_associations'] = int(report['mapping_status'].eq('matched').sum())
+    scores['duplicate_policy'] = duplicate_policy
+    if study is not None:
+        scores['study_accession'] = study
+    scores['complete_model'] = complete
     scores['reference_source'] = reference_source
     return scores, reference, report
 
@@ -427,6 +541,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--vcf', required=True, help='Local VCF/VCF.gz/VCF.bgz or - for text stdin.')
     parser.add_argument('--gwas', required=True, help='GWAS Catalog associations TSV.')
+    parser.add_argument('--study', help='Optional STUDY ACCESSION filter; omitted pools selected associations.')
     parser.add_argument('--trait', help='Optional exact DISEASE/TRAIT filter.')
     parser.add_argument('--pvalue-text', help='Optional exact P-VALUE (TEXT) filter; empty string selects missing.')
     parser.add_argument('--genome-build', choices=['GRCh38'], required=True)
@@ -434,6 +549,8 @@ def main(argv=None):
                         help='hail: verify REF against Hail GRCh38 FASTA before inference; ALT comes from VCF.')
     parser.add_argument('--effect-type', choices=['auto', 'or', 'beta'], default='auto',
                         help='auto requires CI text to identify OR versus beta; verify the study model.')
+    parser.add_argument('--duplicate-policy', choices=['exclude', 'lowest_p'], default='exclude',
+                        help='lowest_p: select the lowest-p eligible association per VCF variant after mapping.')
     parser.add_argument('--frequency-samples', help='One VCF ID per line, no header; ideally ancestry-matched controls.')
     parser.add_argument('--max-af-diff', type=float, default=.10)
     parser.add_argument('--min-af-gap', type=float, default=.10)
@@ -452,12 +569,13 @@ def main(argv=None):
         frequency_samples = [s.strip() for s in Path(args.frequency_samples).read_text().splitlines() if s.strip()]
     try:
         scores, reference, report = score_gwas_vcf(
-            args.vcf, args.gwas, genome_build=args.genome_build,
+            args.vcf, args.gwas, genome_build=args.genome_build, study=args.study,
             trait=args.trait, pvalue_text=args.pvalue_text, effect_type=args.effect_type,
             frequency_samples=frequency_samples, allow_partial=args.allow_partial,
             max_af_diff=args.max_af_diff, min_af_gap=args.min_af_gap,
             min_af_samples=args.min_af_samples, min_af_call_rate=args.min_af_call_rate,
-            palindromic_maf_max=args.palindromic_maf_max, reference_source=args.reference_source)
+            palindromic_maf_max=args.palindromic_maf_max, reference_source=args.reference_source,
+            duplicate_policy=args.duplicate_policy)
         exit_code = 0
     except IncompleteGWASScoreError as error:
         reference, report = error.reference, error.report
@@ -470,6 +588,8 @@ def main(argv=None):
     with paths['reference'].open('x') as handle:
         handle.write('#HmPOS_build=GRCh38\n#score_type=exploratory_GWAS_associations\n')
         handle.write(f'#selected_associations={len(report)}\n#effect_type_mode={args.effect_type}\n')
+        handle.write(f'#variants_number={len(reference)}\n#duplicate_policy={args.duplicate_policy}\n')
+        handle.write(f'#study_accession={args.study or "pooled"}\n')
         handle.write(f'#reference_source={args.reference_source}\n')
         handle.write(f'#max_af_diff={args.max_af_diff}\n#min_af_gap={args.min_af_gap}\n')
         handle.write(f'#palindromic_maf_max={args.palindromic_maf_max}\n')
@@ -482,6 +602,8 @@ def main(argv=None):
     else:
         print('Saved harmonized candidates and audit report; no score file was written.', file=sys.stderr)
     print(report['status'].value_counts().to_string())
+    print('Mapping statuses (before weight selection):')
+    print(report['mapping_status'].value_counts().to_string())
     return exit_code
 
 

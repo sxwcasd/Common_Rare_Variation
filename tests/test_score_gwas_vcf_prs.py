@@ -155,8 +155,11 @@ class GWASVCFTests(unittest.TestCase):
             with self.subTest(ref=ref, alt=alt):
                 self.assert_excluded([association()], [record(ref=ref, alt=alt)])
 
-    def test_split_multiallelic_conflict_excluded(self):
-        self.assert_excluded([association()], [record(), record(alt="G")])
+    def test_split_multiallelic_alt_candidate_can_be_scored(self):
+        scores, reference, report = self.score([association()], [record(), record(alt="G")])
+        self.assertEqual(reference.vcf_alt.tolist(), ['A'])
+        self.assertEqual(report.mapping_status.tolist(), ['matched'])
+        np.testing.assert_allclose(scores.PRS_GWAS, [0.2, 0])
 
     def test_identical_vcf_duplicate_counts_once(self):
         scores, reference, _ = self.score([association()], [record(), record()])
@@ -291,6 +294,110 @@ class GWASVCFTests(unittest.TestCase):
             reference = pd.read_csv(str(prefix) + ".harmonized.tsv", sep="\t", comment="#")
             self.assertEqual(len(report), 2)
             self.assertEqual(len(reference), 1)
+
+
+class LowestPSelectionTests(unittest.TestCase):
+    score = GWASVCFTests.score
+    assert_excluded = GWASVCFTests.assert_excluded
+
+    def test_mapping_retains_repeated_studies_before_weight_selection(self):
+        rows = [association(weight=0.2, **{'P-VALUE': '1e-5'}),
+                association(weight=0.8, **{'P-VALUE': '1e-9'})]
+        scores, reference, report = self.score(rows, [record()], duplicate_policy='lowest_p')
+        self.assertTrue(report.mapping_status.eq('matched').all())
+        self.assertTrue(report.coordinate_match.all())
+        self.assertTrue(report.sequence_match.all())
+        self.assertEqual(report.status.tolist(), ['duplicate_association_not_selected', 'accepted'])
+        self.assertEqual(reference.effect_weight.tolist(), [0.8])
+        self.assertEqual(scores.n_scored_variants.tolist(), [1, 1])
+        self.assertTrue(scores.complete_model.all())
+        np.testing.assert_allclose(scores.PRS_GWAS, [0.8, 0])
+
+    def test_selection_uses_only_eligible_weights(self):
+        rows = [association(weight=0.2, **{'P-VALUE': '1e-30', '95% CI (TEXT)': 'NR'}),
+                association(weight=0.8, **{'P-VALUE': '1e-9'})]
+        scores, reference, report = self.score(rows, [record()], duplicate_policy='lowest_p', allow_partial=True)
+        self.assertTrue(report.mapping_status.eq('matched').all())
+        self.assertEqual(report.status.tolist(), ['unknown_effect_type', 'accepted'])
+        self.assertEqual(reference.effect_weight.tolist(), [0.8])
+        np.testing.assert_allclose(scores.PRS_GWAS, [0.8, 0])
+
+    def test_different_effect_alleles_do_not_double_count_one_variant(self):
+        rows = [association(effect='A', weight=0.2, **{'P-VALUE': '1e-5'}),
+                association(effect='C', weight=0.8, **{'P-VALUE': '1e-9'})]
+        scores, reference, _ = self.score(rows, [record()], duplicate_policy='lowest_p')
+        self.assertEqual(reference.effect_allele.tolist(), ['C'])
+        np.testing.assert_allclose(scores.PRS_GWAS, [0.8, 1.6])
+
+    def test_lowest_p_order_is_numeric_and_does_not_underflow(self):
+        rows = [association(weight=0.2, **{'P-VALUE': '1e-400'}),
+                association(weight=0.8, **{'P-VALUE': '1e-500'})]
+        _, reference, _ = self.score(rows, [record()], duplicate_policy='lowest_p')
+        self.assertEqual(reference.effect_weight.tolist(), [0.8])
+
+    def test_tied_p_with_different_weights_remains_unresolved(self):
+        rows = [association(weight=0.2, **{'P-VALUE': '1e-9'}),
+                association(weight=0.8, **{'P-VALUE': '1e-9'})]
+        report = self.assert_excluded(rows, [record()], duplicate_policy='lowest_p', allow_partial=True)
+        self.assertTrue(report.status.eq('tied_pvalue_conflicting_weights').all())
+        self.assertTrue(report.mapping_status.eq('matched').all())
+
+    def test_identical_tied_estimates_contribute_once(self):
+        rows = [association(weight=0.2, **{'P-VALUE': '1e-9'})] * 2
+        scores, reference, _ = self.score(rows, [record()], duplicate_policy='lowest_p')
+        self.assertEqual(len(reference), 1)
+        np.testing.assert_allclose(scores.PRS_GWAS, [0.2, 0])
+
+    def test_duplicate_weights_with_no_p_cannot_be_ranked(self):
+        report = self.assert_excluded([association(weight=0.2), association(weight=0.8)],
+                                     [record()], duplicate_policy='lowest_p')
+        self.assertTrue(report.status.eq('missing_selection_pvalue').all())
+
+    def test_unknown_weight_still_receives_allele_mapping(self):
+        report = self.assert_excluded([association(**{'95% CI (TEXT)': 'NR'})], [record()])
+        self.assertEqual(report.mapping_status.tolist(), ['matched'])
+        self.assertEqual(report.weight_status.tolist(), ['unknown_effect_type'])
+
+    def test_split_reference_effect_is_not_two_minus_one_split_alt(self):
+        report = self.assert_excluded([association(effect='C')],
+                                     [record(), record(alt='G')], duplicate_policy='lowest_p')
+        self.assertEqual(report.mapping_status.tolist(), ['split_site_ref_effect_ambiguous'])
+        self.assertTrue(report.sequence_match.all())
+
+    def test_different_alt_candidates_without_af_remain_ambiguous(self):
+        report = self.assert_excluded([association()], [record(), record(alt='T')])
+        self.assertEqual(report.mapping_status.tolist(), ['ambiguous_vcf_candidates'])
+
+    def test_frequency_can_select_between_two_alt_candidates(self):
+        calls_a = ('0/1', '0/0', '0/0', '0/0')
+        calls_t = ('0/1', '1/1', '1/1', '0/1')
+        scores, reference, report = self.score(
+            [association(frequency=0.125)], [record(gt=calls_a), record(alt='T', gt=calls_t)],
+            samples=('a', 'b', 'c', 'd'))
+        self.assertEqual(reference.effect_allele.tolist(), ['A'])
+        self.assertEqual(report.n_sequence_candidates.tolist(), [2])
+        np.testing.assert_allclose(scores.PRS_GWAS, [0.2, 0, 0, 0])
+
+    def test_invalid_duplicate_mode_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'duplicate_policy'):
+            self.score([association()], [record()], duplicate_policy='first')
+
+    def test_pooled_lowest_p_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            catalog, calls, prefix = path / 'gwas.tsv', path / 'samples.vcf', path / 'result'
+            pd.DataFrame([
+                association(weight=0.2, **{'P-VALUE': '1e-5'}),
+                association(weight=0.8, **{'P-VALUE': '1e-9', 'STUDY ACCESSION': 'OTHER'}),
+            ]).to_csv(catalog, sep='\t', index=False)
+            calls.write_text(vcf([record()]).getvalue())
+            with redirect_stdout(io.StringIO()):
+                rc = main(['--gwas', str(catalog), '--vcf', str(calls), '--genome-build', 'GRCh38',
+                           '--duplicate-policy', 'lowest_p', '--out-prefix', str(prefix)])
+            self.assertEqual(rc, 0)
+            ref = pd.read_csv(str(prefix) + '.harmonized.tsv', sep='\t', comment='#')
+            self.assertEqual(ref['STUDY ACCESSION'].tolist(), ['OTHER'])
+            self.assertEqual(ref.effect_weight.tolist(), [0.8])
 
 
 class ReferenceGenomeTests(unittest.TestCase):
